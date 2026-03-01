@@ -159,6 +159,8 @@ const NIGHT_COLOR   = '#3a6aad';
 const MORNING_BG    = 'rgba(245,200,66,0.08)';
 const NIGHT_BG      = 'rgba(58,106,173,0.15)';
 
+function todLabel(tod) { return tod === 'Night' ? 'Evening' : tod; }
+
 let selectedRoutes = [];
 let allRows = [];
 
@@ -206,7 +208,19 @@ function parseCSV(text) {
   return rows;
 }
 
-function toTimeMinutes(t) {
+function parseDate(s) {
+  if (!s) return null;
+  // Format: "Tue, Nov 5 " — no year. Rides span Nov 2024 – Feb 2025.
+  // Months Nov/Dec = 2024, Jan/Feb/Mar = 2025
+  const MONTHS = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
+  const m = s.trim().match(/([A-Za-z]+)\s+(\d+)/);
+  if (!m) return null;
+  const mon = MONTHS[m[1]];
+  if (mon === undefined) return null;
+  const day = parseInt(m[2]);
+  const year = mon >= 10 ? 2024 : 2025; // Nov/Dec = 2024, everything else = 2025
+  return new Date(year, mon, day);
+}
   const m = t.match(/(\d+):(\d+)\s*(AM|PM)/i);
   if (!m) return 9999;
   let h = parseInt(m[1]), mn = parseInt(m[2]);
@@ -248,7 +262,7 @@ function drawTrend() {
   const chartH = H - PAD.top - PAD.bottom;
 
   const series = selectedRoutes.map(pickup => {
-    const rides = allRows.filter(r => r.pickup === pickup).sort((a,b) => new Date(a.date) - new Date(b.date));
+    const rides = allRows.filter(r => r.pickup === pickup).sort((a,b) => parseDate(a.date) - parseDate(b.date));
     const tod = rides[0]?.tod || 'Morning';
     return { pickup, rides, tod, color: tod === 'Morning' ? MORNING_COLOR : NIGHT_COLOR };
   });
@@ -272,12 +286,12 @@ function drawTrend() {
   if (trendMode === 'chrono') {
     // ---- CHRONOLOGICAL MODE ----
     // Find overall date range across all selected series
-    const allDates = series.flatMap(s => s.rides.map(r => new Date(r.date)));
+    const allDates = series.flatMap(s => s.rides.map(r => parseDate(r.date)));
     const minDate = new Date(Math.min(...allDates));
     const maxDate = new Date(Math.max(...allDates));
     const dateRange = maxDate - minDate || 1;
 
-    const xOfDate = d => PAD.left + ((new Date(d) - minDate) / dateRange) * chartW;
+    const xOfDate = d => PAD.left + ((parseDate(d) - minDate) / dateRange) * chartW;
 
     // Draw lines
     for (const s of series) {
@@ -390,7 +404,7 @@ function render(rows) {
     <div class="kpi-value">${rows.length}</div>
     <div class="kpi-sub-detail">
       <span style="color:var(--morning)">▲ ${morning.length} morning</span><br>
-      <span style="color:#7aaae0">▼ ${night.length} night</span>
+      <span style="color:#7aaae0">▼ ${night.length} evening</span>
     </div>
   </div>`;
 
@@ -402,7 +416,7 @@ function render(rows) {
 
   const mnBarHTML = [
     {label:'Morning', val:avgM, color:MORNING_COLOR, cls:'morning'},
-    {label:'Night',   val:avgN, color:NIGHT_COLOR,   cls:'night'}
+    {label:'Evening',   val:avgN, color:NIGHT_COLOR,   cls:'night'}
   ].map(d => `<div class="mn-bar-row">
     <div class="mn-bar-lbl ${d.cls}">${d.label}</div>
     <div class="mn-bar-track">
@@ -410,7 +424,7 @@ function render(rows) {
     </div>
   </div>`).join('');
   const kpiMN = `<div class="kpi">
-    <div class="kpi-label">Avg Duration · M vs N</div>
+    <div class="kpi-label">Avg Duration · M vs E</div>
     <div class="mn-bar-wrap">${mnBarHTML}</div>
   </div>`;
 
@@ -463,7 +477,7 @@ function render(rows) {
       html += `<tr>
         <td><button class="star-btn ${isFav?'active':''}" onclick="toggleFav('${pickup.replace(/'/g,"\\'")}', this)">★</button></td>
         <td>${pickup}</td>
-        <td><span class="tag ${tagCls}">${data.tod}</span></td>
+        <td><span class="tag ${tagCls}">${data.tod === 'Night' ? 'Evening' : data.tod}</span></td>
         <td>${n}</td><td>${fmtMins(a)}</td><td>${fmtMins(mx)}</td><td>${fmtMins(mn)}</td>
         <td class="${dClass}">${d!==null?(d>=0?'+':'')+fmtMins(d):'—'}</td>
       </tr>`;
@@ -499,17 +513,30 @@ function render(rows) {
       <div class="vert-chart">${vertCols}</div>
       <div class="stacked-legend">
         <div class="legend-item"><div class="legend-dot" style="background:${MORNING_COLOR}"></div><span style="color:var(--morning)">Morning</span></div>
-        <div class="legend-item"><div class="legend-dot" style="background:${NIGHT_COLOR}"></div><span style="color:#7aaae0">Night</span></div>
+        <div class="legend-item"><div class="legend-dot" style="background:${NIGHT_COLOR}"></div><span style="color:#7aaae0">Evening</span></div>
       </div>
     </div>`;
 
-  // ---- TREND CONTROLS ----
-  const trendPills = routeEntries.map(([pickup, data]) => {
-    const tod = data.tod;
+  // ---- TREND CONTROLS — two rows ----
+  const morningPills = routeEntries.filter(([,d]) => d.tod === 'Morning').map(([pickup, data]) => {
     const isActive = selectedRoutes.includes(pickup);
-    const activeCls = isActive ? `active-${tod.toLowerCase()}` : '';
-    return `<button class="route-pill ${activeCls}" onclick="toggleRoute('${pickup.replace(/'/g,"\\'")}', '${tod}', this)">${pickup} <span style="opacity:0.6">(${data.durations.length})</span></button>`;
+    return `<button class="route-pill ${isActive?'active-morning':''}" onclick="toggleRoute('${pickup.replace(/'/g,"\\'")}', 'Morning', this)">${pickup} <span style="opacity:0.6">(${data.durations.length})</span></button>`;
   }).join('');
+  const eveningPills = routeEntries.filter(([,d]) => d.tod === 'Night').map(([pickup, data]) => {
+    const isActive = selectedRoutes.includes(pickup);
+    return `<button class="route-pill ${isActive?'active-night':''}" onclick="toggleRoute('${pickup.replace(/'/g,"\\'")}', 'Night', this)">${pickup} <span style="opacity:0.6">(${data.durations.length})</span></button>`;
+  }).join('');
+  const trendPills = `
+    <div style="display:flex;flex-direction:column;gap:6px;">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <span style="font-size:9px;color:var(--morning);letter-spacing:.08em;text-transform:uppercase;width:52px;flex-shrink:0">Morning</span>
+        ${morningPills}
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <span style="font-size:9px;color:#7aaae0;letter-spacing:.08em;text-transform:uppercase;width:52px;flex-shrink:0">Evening</span>
+        ${eveningPills}
+      </div>
+    </div>`;
 
   // ---- RECENT RIDES ----
   const recentHTML = [...rows].slice(-20).reverse().map(r => {
@@ -521,7 +548,7 @@ function render(rows) {
       <div class="tl-dot" style="background:${c}"></div>
       <div>
         <div class="tl-duration">${fmtMins(r.actualDur)}</div>
-        <div class="tl-meta">${r.dow==='T'?'Tue':r.dow==='W'?'Wed':'Thu'} · ${r.tod}${delayTxt?` · <span class="${dClass}">${delayTxt}</span>`:''}</div>
+        <div class="tl-meta">${r.dow==='T'?'Tue':r.dow==='W'?'Wed':'Thu'} · ${r.tod==='Night'?'Evening':r.tod}${delayTxt?` · <span class="${dClass}">${delayTxt}</span>`:''}</div>
       </div>
     </div>`;
   }).join('');
@@ -605,3 +632,4 @@ loadData();
 </script>
 </body>
 </html>
+
