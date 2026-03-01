@@ -221,6 +221,8 @@ function parseDate(s) {
   const year = mon >= 10 ? 2024 : 2025; // Nov/Dec = 2024, everything else = 2025
   return new Date(year, mon, day);
 }
+
+function toTimeMinutes(t) {
   const m = t.match(/(\d+):(\d+)\s*(AM|PM)/i);
   if (!m) return 9999;
   let h = parseInt(m[1]), mn = parseInt(m[2]);
@@ -632,4 +634,3 @@ loadData();
 </script>
 </body>
 </html>
-
