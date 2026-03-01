@@ -30,7 +30,7 @@
   .error-msg { color: var(--red); font-size: 12px; text-align: center; padding: 40px; line-height: 2; }
 
   /* KPI row */
-  .kpi-row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 16px; }
+  .kpi-row { display: grid; grid-template-columns: repeat(8, 1fr); gap: 16px; }
   .kpi { background: var(--surface); border: 1px solid var(--border); padding: 20px; position: relative; overflow: hidden; }
   .kpi::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--accent); }
   .kpi.morning-top::before { background: var(--morning); }
@@ -191,7 +191,11 @@ function getBucket(mins) {
 const bucketLabels = ['<1:10','1:10–1:25','1:25–1:35','1:35–1:50','1:50+'];
 
 function parseCSV(text) {
+  const MONTH_NAMES = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
   const lines = text.trim().split('\n'); const rows = [];
+  let currentYear = 2024; // first ride Nov 2024
+  let lastMonth = -1;
+
   for (const line of lines) {
     const cols = []; let cur = '', inQ = false;
     for (let i = 0; i < line.length; i++) {
@@ -200,26 +204,37 @@ function parseCSV(text) {
       else { cur += line[i]; }
     }
     cols.push(cur.trim());
-    const dow = cols[1]?.trim(), tod = cols[2]?.trim(), date = cols[5]?.trim(), pickup = cols[6]?.trim();
+    const dow = cols[1]?.trim(), tod = cols[2]?.trim(), dateStr = cols[5]?.trim(), pickup = cols[6]?.trim();
     const delay = parseDuration(cols[9]?.trim()), actualDur = parseDuration(cols[12]?.trim());
     if (!['T','W','R'].includes(dow) || !['Morning','Night'].includes(tod) || !actualDur) continue;
-    rows.push({ dow, tod, date, pickup, delay, actualDur });
+
+    // Parse month from date string like "Tue, Nov 5"
+    const dm = dateStr?.match(/([A-Za-z]+)\s+(\d+)/);
+    let parsedDate = null;
+    if (dm) {
+      const mon = MONTH_NAMES[dm[1]];
+      if (mon !== undefined) {
+        // Detect year rollover: if month goes backwards, we crossed into a new year
+        if (lastMonth !== -1 && mon < lastMonth - 1) currentYear++;
+        lastMonth = mon;
+        parsedDate = new Date(currentYear, mon, parseInt(dm[2]));
+      }
+    }
+
+    rows.push({ dow, tod, date: dateStr, parsedDate, pickup, delay, actualDur });
   }
   return rows;
 }
 
 function parseDate(s) {
+  // Fallback for any string without a pre-parsed date — shouldn't normally be needed
   if (!s) return null;
-  // Format: "Tue, Nov 5 " — no year. Rides span Nov 2024 – Feb 2025.
-  // Months Nov/Dec = 2024, Jan/Feb/Mar = 2025
   const MONTHS = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
   const m = s.trim().match(/([A-Za-z]+)\s+(\d+)/);
   if (!m) return null;
   const mon = MONTHS[m[1]];
   if (mon === undefined) return null;
-  const day = parseInt(m[2]);
-  const year = mon >= 10 ? 2024 : 2025; // Nov/Dec = 2024, everything else = 2025
-  return new Date(year, mon, day);
+  return new Date(2024, mon, parseInt(m[2]));
 }
 
 function toTimeMinutes(t) {
@@ -264,7 +279,7 @@ function drawTrend() {
   const chartH = H - PAD.top - PAD.bottom;
 
   const series = selectedRoutes.map(pickup => {
-    const rides = allRows.filter(r => r.pickup === pickup).sort((a,b) => parseDate(a.date) - parseDate(b.date));
+    const rides = allRows.filter(r => r.pickup === pickup).sort((a,b) => a.parsedDate - b.parsedDate);
     const tod = rides[0]?.tod || 'Morning';
     return { pickup, rides, tod, color: tod === 'Morning' ? MORNING_COLOR : NIGHT_COLOR };
   });
@@ -288,39 +303,40 @@ function drawTrend() {
   if (trendMode === 'chrono') {
     // ---- CHRONOLOGICAL MODE ----
     // Find overall date range across all selected series
-    const allDates = series.flatMap(s => s.rides.map(r => parseDate(r.date)));
+    const allDates = series.flatMap(s => s.rides.map(r => r.parsedDate)).filter(Boolean);
     const minDate = new Date(Math.min(...allDates));
     const maxDate = new Date(Math.max(...allDates));
     const dateRange = maxDate - minDate || 1;
 
-    const xOfDate = d => PAD.left + ((parseDate(d) - minDate) / dateRange) * chartW;
+    const xOfDate = r => PAD.left + ((r.parsedDate - minDate) / dateRange) * chartW;
 
     // Draw lines
     for (const s of series) {
       if (s.rides.length === 0) continue;
       ctx.beginPath(); ctx.strokeStyle = s.color; ctx.lineWidth = 2;
       s.rides.forEach((r, i) => {
-        const x = xOfDate(r.date), y = yOf(r.actualDur);
+        const x = xOfDate(r), y = yOf(r.actualDur);
         i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
       });
       ctx.stroke();
       s.rides.forEach(r => {
-        ctx.beginPath(); ctx.arc(xOfDate(r.date), yOf(r.actualDur), 2.5, 0, Math.PI * 2);
+        ctx.beginPath(); ctx.arc(xOfDate(r), yOf(r.actualDur), 2.5, 0, Math.PI * 2);
         ctx.fillStyle = s.color; ctx.fill();
       });
     }
 
-    // X axis: month labels — "Nov 1", "Dec 1", etc.
-    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    // X axis: month labels — "Nov'24", "Dec'24", "Jan'25" etc.
+    const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
     let d = new Date(minDate.getFullYear(), minDate.getMonth(), 1);
-    ctx.fillStyle = 'rgba(122,117,104,0.7)'; ctx.font = `9px 'DM Mono', monospace`; ctx.textAlign = 'center';
+    ctx.font = `9px 'DM Mono', monospace`; ctx.textAlign = 'center';
     while (d <= maxDate) {
-      const x = xOfDate(d);
-      if (x >= PAD.left && x <= PAD.left + chartW) {
+      const x = PAD.left + ((d - minDate) / dateRange) * chartW;
+      if (x >= PAD.left - 1 && x <= PAD.left + chartW + 1) {
         ctx.beginPath(); ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
         ctx.moveTo(x, PAD.top); ctx.lineTo(x, PAD.top + chartH); ctx.stroke();
         ctx.fillStyle = 'rgba(122,117,104,0.7)';
-        ctx.fillText(`${MONTHS[d.getMonth()]} 1`, x, H - 6);
+        const yr = String(d.getFullYear()).slice(2);
+        ctx.fillText(`${MONTH_NAMES[d.getMonth()]}'${yr}`, x, H - 6);
       }
       d = new Date(d.getFullYear(), d.getMonth() + 1, 1);
     }
@@ -430,7 +446,12 @@ function render(rows) {
     <div class="mn-bar-wrap">${mnBarHTML}</div>
   </div>`;
 
-  const kpiStats = `<div class="kpi" style="grid-column:span 3">
+  const minMorning = morning.reduce((a,b) => a.actualDur < b.actualDur ? a : b);
+  const maxMorning = morning.reduce((a,b) => a.actualDur > b.actualDur ? a : b);
+  const minNight = night.reduce((a,b) => a.actualDur < b.actualDur ? a : b);
+  const maxNight = night.reduce((a,b) => a.actualDur > b.actualDur ? a : b);
+
+  const kpiStats = `<div class="kpi" style="grid-column:span 5">
     <div class="kpi-label">Ride Stats</div>
     <div class="ride-stat-row">
       <div class="ride-stat">
@@ -440,15 +461,27 @@ function render(rows) {
       </div>
       <div class="ride-stat-divider"></div>
       <div class="ride-stat">
-        <div class="ride-stat-label" style="color:var(--green)">Best</div>
-        <div class="ride-stat-val" style="color:var(--green)">${fmtMins(minRow.actualDur)}</div>
-        <div class="ride-stat-meta">${minRow.date} · ${minRow.pickup || minRow.tod}</div>
+        <div class="ride-stat-label" style="color:var(--green)">Best · <span style="color:var(--morning)">Morning</span></div>
+        <div class="ride-stat-val" style="color:var(--green)">${fmtMins(minMorning.actualDur)}</div>
+        <div class="ride-stat-meta">${minMorning.date} · ${minMorning.pickup || ''}</div>
       </div>
       <div class="ride-stat-divider"></div>
       <div class="ride-stat">
-        <div class="ride-stat-label" style="color:var(--red)">Worst</div>
-        <div class="ride-stat-val" style="color:var(--red)">${fmtMins(maxRow.actualDur)}</div>
-        <div class="ride-stat-meta">${maxRow.date} · ${maxRow.pickup || maxRow.tod}</div>
+        <div class="ride-stat-label" style="color:var(--green)">Best · <span style="color:#7aaae0">Evening</span></div>
+        <div class="ride-stat-val" style="color:var(--green)">${fmtMins(minNight.actualDur)}</div>
+        <div class="ride-stat-meta">${minNight.date} · ${minNight.pickup || ''}</div>
+      </div>
+      <div class="ride-stat-divider"></div>
+      <div class="ride-stat">
+        <div class="ride-stat-label" style="color:var(--red)">Worst · <span style="color:var(--morning)">Morning</span></div>
+        <div class="ride-stat-val" style="color:var(--red)">${fmtMins(maxMorning.actualDur)}</div>
+        <div class="ride-stat-meta">${maxMorning.date} · ${maxMorning.pickup || ''}</div>
+      </div>
+      <div class="ride-stat-divider"></div>
+      <div class="ride-stat">
+        <div class="ride-stat-label" style="color:var(--red)">Worst · <span style="color:#7aaae0">Evening</span></div>
+        <div class="ride-stat-val" style="color:var(--red)">${fmtMins(maxNight.actualDur)}</div>
+        <div class="ride-stat-meta">${maxNight.date} · ${maxNight.pickup || ''}</div>
       </div>
     </div>
   </div>`;
