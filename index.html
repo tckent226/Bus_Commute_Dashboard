@@ -103,6 +103,12 @@
   .trend-toggle-btn.active { background: rgba(232,168,68,0.1); border-color: var(--accent); color: var(--accent); }
   .trend-toggle-btn:hover:not(.active) { border-color: var(--muted); color: var(--text); }
 
+  /* Tooltip */
+  .trend-tooltip { position: fixed; background: #1a1916; border: 1px solid #2e2c28; padding: 10px 14px; font-size: 11px; pointer-events: none; z-index: 100; min-width: 160px; line-height: 1.8; display: none; }
+  .tooltip-route { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 4px; }
+  .tooltip-dur { font-family: 'Fraunces', serif; font-size: 18px; font-weight: 600; line-height: 1; margin-bottom: 2px; }
+  .tooltip-vs { font-size: 10px; }
+
   .timeline { display: flex; flex-direction: column; max-height: 380px; overflow-y: auto; }
   .tl-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); }
   .tl-row:last-child { border-bottom: none; }
@@ -149,6 +155,7 @@
 <div class="main" id="main-content">
   <div class="loading"><div class="loading-spinner"></div><p>Fetching your commute data...</p></div>
 </div>
+<div class="trend-tooltip" id="trendTooltip"></div>
 
 <footer>Built with Claude · Live data from Google Sheets · <span class="highlight" id="footer-count">—</span> rides tracked</footer>
 
@@ -159,8 +166,15 @@ const NIGHT_COLOR   = '#3a6aad';
 const MORNING_BG    = 'rgba(245,200,66,0.08)';
 const NIGHT_BG      = 'rgba(58,106,173,0.15)';
 
+// Line styles: solid, dashed, dotted (canvas dash patterns)
+const LINE_STYLES = [[],[6,4],[2,3]];
+const MAX_PER_TOD = 3;
+
 function todLabel(tod) { return tod === 'Night' ? 'Evening' : tod; }
 
+// Track morning/evening counts separately
+let morningSelected = [];
+let eveningSelected = [];
 let selectedRoutes = [];
 let allRows = [];
 
@@ -247,7 +261,8 @@ function toTimeMinutes(t) {
 }
 
 // ---- TREND CHART ----
-let trendMode = 'chrono'; // 'chrono' | 'count'
+let trendMode = 'chrono';
+let trendSeries = []; // kept for tooltip hit-testing
 
 function setTrendMode(mode) {
   trendMode = mode;
@@ -263,137 +278,182 @@ function drawTrend() {
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
-  const W = canvas.offsetWidth, H = 260;
+  const W = canvas.offsetWidth, H = 280;
   canvas.width = W * dpr; canvas.height = H * dpr;
   canvas.style.height = H + 'px';
   ctx.scale(dpr, dpr);
   ctx.clearRect(0, 0, W, H);
 
   if (selectedRoutes.length === 0) {
-    emptyMsg.style.display = 'block'; legendWrap.innerHTML = ''; return;
+    emptyMsg.style.display = 'block'; legendWrap.innerHTML = ''; trendSeries = []; return;
   }
   emptyMsg.style.display = 'none';
 
-  const PAD = { top: 16, right: 16, bottom: 36, left: 40 };
+  const PAD = { top: 16, right: 16, bottom: 36, left: 44 };
   const chartW = W - PAD.left - PAD.right;
   const chartH = H - PAD.top - PAD.bottom;
 
-  const series = selectedRoutes.map(pickup => {
-    const rides = allRows.filter(r => r.pickup === pickup).sort((a,b) => a.parsedDate - b.parsedDate);
-    const tod = rides[0]?.tod || 'Morning';
-    return { pickup, rides, tod, color: tod === 'Morning' ? MORNING_COLOR : NIGHT_COLOR };
-  });
+  // Fixed y-axis: 60 mins (1:00) to 135 mins (2:15), 15-min increments
+  const Y_MIN = 60, Y_MAX = 135;
+  const yOf = d => PAD.top + chartH - ((Math.min(Math.max(d, Y_MIN), Y_MAX) - Y_MIN) / (Y_MAX - Y_MIN)) * chartH;
 
-  const allDurs = series.flatMap(s => s.rides.map(r => r.actualDur));
-  const minD = Math.max(0, Math.min(...allDurs) - 5);
-  const maxD = Math.max(...allDurs) + 5;
-  const yOf = d => PAD.top + chartH - ((d - minD) / (maxD - minD)) * chartH;
-
-  // Y grid lines
-  const yTicks = 4;
-  ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1;
-  for (let i = 0; i <= yTicks; i++) {
-    const y = PAD.top + (i / yTicks) * chartH;
+  // Y grid lines at 15-min intervals
+  ctx.font = `9px 'DM Mono', monospace`; ctx.textAlign = 'right';
+  for (let v = Y_MIN; v <= Y_MAX; v += 15) {
+    const y = yOf(v);
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.lineWidth = 1; ctx.setLineDash([]);
     ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(PAD.left + chartW, y); ctx.stroke();
-    const val = maxD - ((maxD - minD) * i / yTicks);
-    ctx.fillStyle = 'rgba(122,117,104,0.7)'; ctx.font = `9px 'DM Mono', monospace`;
-    ctx.textAlign = 'right'; ctx.fillText(fmtMins(Math.round(val)), PAD.left - 4, y + 3);
+    ctx.fillStyle = 'rgba(122,117,104,0.7)';
+    ctx.fillText(fmtMins(v), PAD.left - 4, y + 3);
   }
 
+  // Build series with line style index per tod
+  let mIdx = 0, eIdx = 0;
+  trendSeries = selectedRoutes.map(pickup => {
+    const rides = allRows.filter(r => r.pickup === pickup).sort((a,b) => a.parsedDate - b.parsedDate);
+    const tod = rides[0]?.tod || 'Morning';
+    const isMorning = tod === 'Morning';
+    const styleIdx = isMorning ? mIdx++ : eIdx++;
+    const routeAvg = avg(rides.map(r => r.actualDur));
+    return { pickup, rides, tod, color: isMorning ? MORNING_COLOR : NIGHT_COLOR, dash: LINE_STYLES[styleIdx] || [], routeAvg };
+  });
+
   if (trendMode === 'chrono') {
-    // ---- CHRONOLOGICAL MODE ----
-    // Find overall date range across all selected series
-    const allDates = series.flatMap(s => s.rides.map(r => r.parsedDate)).filter(Boolean);
+    const allDates = trendSeries.flatMap(s => s.rides.map(r => r.parsedDate)).filter(Boolean);
     const minDate = new Date(Math.min(...allDates));
     const maxDate = new Date(Math.max(...allDates));
     const dateRange = maxDate - minDate || 1;
-
     const xOfDate = r => PAD.left + ((r.parsedDate - minDate) / dateRange) * chartW;
 
-    // Draw lines
-    for (const s of series) {
-      if (s.rides.length === 0) continue;
-      ctx.beginPath(); ctx.strokeStyle = s.color; ctx.lineWidth = 2;
-      s.rides.forEach((r, i) => {
-        const x = xOfDate(r), y = yOf(r.actualDur);
-        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-      });
+    for (const s of trendSeries) {
+      if (!s.rides.length) continue;
+      ctx.setLineDash(s.dash); ctx.strokeStyle = s.color; ctx.lineWidth = 2;
+      ctx.beginPath();
+      s.rides.forEach((r, i) => { const x = xOfDate(r), y = yOf(r.actualDur); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
       ctx.stroke();
+      ctx.setLineDash([]);
       s.rides.forEach(r => {
-        ctx.beginPath(); ctx.arc(xOfDate(r), yOf(r.actualDur), 2.5, 0, Math.PI * 2);
+        ctx.beginPath(); ctx.arc(xOfDate(r), yOf(r.actualDur), 2.9, 0, Math.PI*2);
         ctx.fillStyle = s.color; ctx.fill();
+        r._x = xOfDate(r); r._y = yOf(r.actualDur); // store for tooltip
       });
     }
 
-    // X axis: month labels — "Nov'24", "Dec'24", "Jan'25" etc.
-    const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    // X axis month labels
+    const MN = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
     let d = new Date(minDate.getFullYear(), minDate.getMonth(), 1);
-    ctx.font = `9px 'DM Mono', monospace`; ctx.textAlign = 'center';
+    ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(122,117,104,0.7)';
     while (d <= maxDate) {
       const x = PAD.left + ((d - minDate) / dateRange) * chartW;
       if (x >= PAD.left - 1 && x <= PAD.left + chartW + 1) {
-        ctx.beginPath(); ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
-        ctx.moveTo(x, PAD.top); ctx.lineTo(x, PAD.top + chartH); ctx.stroke();
-        ctx.fillStyle = 'rgba(122,117,104,0.7)';
-        const yr = String(d.getFullYear()).slice(2);
-        ctx.fillText(`${MONTH_NAMES[d.getMonth()]}'${yr}`, x, H - 6);
+        ctx.setLineDash([]); ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(x, PAD.top); ctx.lineTo(x, PAD.top+chartH); ctx.stroke();
+        ctx.fillText(`${MN[d.getMonth()]}'${String(d.getFullYear()).slice(2)}`, x, H-6);
       }
-      d = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+      d = new Date(d.getFullYear(), d.getMonth()+1, 1);
     }
 
   } else {
-    // ---- ABSOLUTE COUNT MODE ----
-    const maxCount = Math.max(...series.map(s => s.rides.length), 1);
-    const xOf = (i, total) => PAD.left + (maxCount <= 1 ? chartW / 2 : (i / (maxCount - 1)) * chartW);
+    const maxCount = Math.max(...trendSeries.map(s => s.rides.length), 1);
+    const xOf = i => PAD.left + (maxCount <= 1 ? chartW/2 : (i/(maxCount-1)) * chartW);
 
-    for (const s of series) {
-      if (s.rides.length === 0) continue;
-      ctx.beginPath(); ctx.strokeStyle = s.color; ctx.lineWidth = 2;
-      s.rides.forEach((r, i) => {
-        const x = xOf(i, maxCount), y = yOf(r.actualDur);
-        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-      });
+    for (const s of trendSeries) {
+      if (!s.rides.length) continue;
+      ctx.setLineDash(s.dash); ctx.strokeStyle = s.color; ctx.lineWidth = 2;
+      ctx.beginPath();
+      s.rides.forEach((r,i) => { const x=xOf(i), y=yOf(r.actualDur); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
       ctx.stroke();
-      s.rides.forEach((r, i) => {
-        ctx.beginPath(); ctx.arc(xOf(i, maxCount), yOf(r.actualDur), 2.5, 0, Math.PI * 2);
+      ctx.setLineDash([]);
+      s.rides.forEach((r,i) => {
+        ctx.beginPath(); ctx.arc(xOf(i), yOf(r.actualDur), 2.9, 0, Math.PI*2);
         ctx.fillStyle = s.color; ctx.fill();
+        r._x = xOf(i); r._y = yOf(r.actualDur);
       });
     }
 
-    // X axis: increments of 10
-    ctx.fillStyle = 'rgba(122,117,104,0.7)'; ctx.font = `9px 'DM Mono', monospace`; ctx.textAlign = 'center';
-    const step = 10;
-    for (let i = 0; i <= maxCount; i += step) {
-      const x = PAD.left + (maxCount <= 1 ? chartW / 2 : (i / (maxCount - 1)) * chartW);
-      ctx.beginPath(); ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
-      ctx.moveTo(x, PAD.top); ctx.lineTo(x, PAD.top + chartH); ctx.stroke();
-      ctx.fillStyle = 'rgba(122,117,104,0.7)';
-      ctx.fillText(i === 0 ? '1' : i, x, H - 6);
+    ctx.setLineDash([]); ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(122,117,104,0.7)';
+    for (let i = 0; i <= maxCount; i += 10) {
+      const x = PAD.left + (maxCount<=1 ? chartW/2 : (i/(maxCount-1))*chartW);
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x,PAD.top); ctx.lineTo(x,PAD.top+chartH); ctx.stroke();
+      ctx.fillText(i===0?'1':i, x, H-6);
     }
   }
 
-  legendWrap.innerHTML = series.map(s =>
-    `<div class="trend-legend-item">
-      <div style="width:16px;height:2px;background:${s.color};flex-shrink:0;border-radius:1px"></div>
+  ctx.setLineDash([]);
+
+  // Legend with line style preview
+  legendWrap.innerHTML = trendSeries.map(s => {
+    const dashStyle = s.dash.length === 0 ? 'solid' : s.dash[0] > 3 ? 'dashed' : 'dotted';
+    const borderStyle = `border-top: 2px ${dashStyle} ${s.color}`;
+    return `<div class="trend-legend-item">
+      <div style="width:20px;height:0;${borderStyle};flex-shrink:0;margin-top:1px"></div>
       <span style="color:${s.color}">${s.pickup}</span>
       <span style="color:var(--muted)">(${s.rides.length} rides)</span>
-    </div>`
-  ).join('');
+    </div>`;
+  }).join('');
+}
+
+// Tooltip logic
+function initTooltip() {
+  const canvas = document.getElementById('trendCanvas');
+  const tip = document.getElementById('trendTooltip');
+  if (!canvas || !tip) return;
+
+  canvas.addEventListener('mousemove', e => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    const HIT = 12;
+    let found = null;
+
+    for (const s of trendSeries) {
+      for (const r of s.rides) {
+        if (r._x === undefined) continue;
+        if (Math.abs(r._x - mx) < HIT && Math.abs(r._y - my) < HIT) {
+          found = { r, s }; break;
+        }
+      }
+      if (found) break;
+    }
+
+    if (found) {
+      const { r, s } = found;
+      const diff = r.actualDur - s.routeAvg;
+      const diffStr = (diff >= 0 ? '+' : '') + fmtMins(Math.round(diff));
+      const diffColor = diff > 5 ? 'var(--red)' : diff < -5 ? 'var(--green)' : 'var(--muted)';
+      tip.innerHTML = `
+        <div class="tooltip-route" style="color:${s.color}">${s.pickup}</div>
+        <div class="tooltip-dur">${fmtMins(r.actualDur)}</div>
+        <div style="color:var(--muted);font-size:10px">${r.date}</div>
+        <div class="tooltip-vs" style="color:${diffColor}">${diffStr} vs route avg</div>`;
+      tip.style.display = 'block';
+      tip.style.left = (e.clientX + 14) + 'px';
+      tip.style.top  = (e.clientY - 10) + 'px';
+    } else {
+      tip.style.display = 'none';
+    }
+  });
+  canvas.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
 }
 
 function toggleRoute(pickup, tod, btn) {
+  const isMorning = tod === 'Morning';
   const isActive = selectedRoutes.includes(pickup);
   if (isActive) {
     selectedRoutes = selectedRoutes.filter(r => r !== pickup);
+    if (isMorning) morningSelected = morningSelected.filter(r => r !== pickup);
+    else eveningSelected = eveningSelected.filter(r => r !== pickup);
     btn.className = 'route-pill';
   } else {
-    if (selectedRoutes.length >= 6) {
-      btn.style.animation = 'none'; btn.offsetHeight;
+    const todList = isMorning ? morningSelected : eveningSelected;
+    if (todList.length >= MAX_PER_TOD) {
       btn.style.borderColor = 'var(--red)'; btn.style.color = 'var(--red)';
       setTimeout(() => { btn.style.borderColor = ''; btn.style.color = ''; }, 800);
       return;
     }
     selectedRoutes.push(pickup);
+    if (isMorning) morningSelected.push(pickup);
+    else eveningSelected.push(pickup);
     btn.className = `route-pill active-${tod.toLowerCase()}`;
   }
   drawTrend();
@@ -498,23 +558,37 @@ function render(rows) {
 
   function buildRouteTable(filterFavs) {
     const favs = getFavs();
+    // If favorites filter is on but no favs exist, show all
+    const effectiveFilter = filterFavs && favs.length > 0;
     let html = `<table><thead><tr>
-      <th></th><th>Departure</th><th>TOD</th><th>Rides</th><th>Avg</th><th>Max</th><th>Min</th><th>Avg Delay</th>
+      <th></th><th>Departure</th><th>TOD</th><th>Rides</th><th>Avg</th><th>Max</th><th>Min</th><th>Avg Delay</th><th>Avg Arrival</th>
     </tr></thead><tbody>`;
     for (const [pickup, data] of routeEntries) {
       const isFav = favs.includes(pickup);
-      if (filterFavs && !isFav) continue;
+      if (effectiveFilter && !isFav) continue;
       const n = data.durations.length, a = Math.round(avg(data.durations));
       const mx = Math.max(...data.durations), mn = Math.min(...data.durations);
       const d = data.delays.length ? Math.round(avg(data.delays)) : null;
       const dClass = d > 5 ? 'delay-pos' : d < -5 ? 'delay-neg' : 'delay-zero';
       const tagCls = data.tod === 'Morning' ? 'tag-morning' : 'tag-night';
+      // Avg Arrival = departure time + avg duration
+      const depMins = toTimeMinutes(pickup);
+      const arrivalMins = depMins !== 9999 ? depMins + a : null;
+      let arrivalStr = '—';
+      if (arrivalMins !== null) {
+        const ah = Math.floor(arrivalMins / 60) % 24;
+        const am = arrivalMins % 60;
+        const ampm = ah >= 12 ? 'PM' : 'AM';
+        const h12 = ah % 12 || 12;
+        arrivalStr = `${h12}:${String(am).padStart(2,'0')} ${ampm}`;
+      }
       html += `<tr>
         <td><button class="star-btn ${isFav?'active':''}" onclick="toggleFav('${pickup.replace(/'/g,"\\'")}', this)">★</button></td>
         <td>${pickup}</td>
         <td><span class="tag ${tagCls}">${data.tod === 'Night' ? 'Evening' : data.tod}</span></td>
         <td>${n}</td><td>${fmtMins(a)}</td><td>${fmtMins(mx)}</td><td>${fmtMins(mn)}</td>
         <td class="${dClass}">${d!==null?(d>=0?'+':'')+fmtMins(d):'—'}</td>
+        <td style="color:var(--muted)">${arrivalStr}</td>
       </tr>`;
     }
     html += '</tbody></table>';
@@ -597,9 +671,9 @@ function render(rows) {
       <div class="card">
         <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;">
           <span>By Route (Departure Time)</span>
-          <button class="filter-fav-btn" id="fav-filter-btn" onclick="toggleFavFilter()">★ Favorites only</button>
+          <button class="filter-fav-btn active" id="fav-filter-btn" onclick="toggleFavFilter()">★ Favorites only</button>
         </div>
-        <div id="route-table-wrap">${buildRouteTable(false)}</div>
+        <div id="route-table-wrap">${buildRouteTable(true)}</div>
       </div>
       <div class="card">
         <div class="section-title">Duration Distribution · Morning vs Night</div>
@@ -628,7 +702,7 @@ function render(rows) {
   `;
 
   // Draw trend after DOM is ready
-  setTimeout(drawTrend, 50);
+  setTimeout(() => { drawTrend(); initTooltip(); }, 50);
 }
 
 function getFavs() {
